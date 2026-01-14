@@ -67,19 +67,5 @@ services:
       - "8000:8000"
     restart: unless-stopped
 
-  visualization:
-    build:
-      context: .
-      dockerfile: services/visualization/Dockerfile
-    container_name: visualization
-    depends_on:
-      - redis
-    environment:
-      - REDIS_HOST=redis
-      - REDIS_PORT=6379
-    ports:
-      - "8001:8001"
-    restart: unless-stopped
-
 volumes:
   kafka_data:
