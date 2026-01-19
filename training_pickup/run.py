@@ -1,17 +1,15 @@
 import argparse
 import pandas as pd
 
-from pathlib import Path
-
 from features.reconstruct import reconstruct_features
 from split import time_split
-from train_eta import train_eta_model
+from training_pickup.train import train_pickup_model
 from eval import evaluate
 from data.schema import FEATURE_COLUMNS, LABEL_COLUMN
 
 
-DATA_PATH = "data/trips_madrid.parquet"
-PICKUP_MODEL_PATH = "services/inference-api/models/eta_model.joblib"
+DATA_PATH = "data/pickup_trips_madrid.parquet"
+PICKUP_MODEL_PATH = "services/inference-api/models/pickup_eta_model.joblib"
 
 
 def main(data_path: str = DATA_PATH, model_path: str = PICKUP_MODEL_PATH):
@@ -28,7 +26,7 @@ def main(data_path: str = DATA_PATH, model_path: str = PICKUP_MODEL_PATH):
     print(f"Train: {len(train)}, Val: {len(val)}")
 
     print("Training XGBoost model...")
-    model = train_eta_model(train, val, model_path)
+    model = train_pickup_model(train, val, model_path)
 
     print("Evaluating model...")
     metrics = evaluate(model, val, FEATURE_COLUMNS, LABEL_COLUMN)
@@ -44,11 +42,11 @@ def main(data_path: str = DATA_PATH, model_path: str = PICKUP_MODEL_PATH):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train ETA prediction model")
+    parser = argparse.ArgumentParser(description="Train pickup ETA prediction model")
     parser.add_argument(
         "--data", 
         default=DATA_PATH, 
-        help="Path to trips parquet file"
+        help="Path to pickup trips parquet file"
     )
     parser.add_argument(
         "--output", 
