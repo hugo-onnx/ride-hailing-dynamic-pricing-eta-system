@@ -1,17 +1,15 @@
 import argparse
 import pandas as pd
 
-from pathlib import Path
-
 from features.reconstruct import reconstruct_features
 from split import time_split
-from train_dropoff import train_dropoff_model
+from training_dropoff.train import train_dropoff_model
 from eval import evaluate
 from data.schema import FEATURE_COLUMNS, LABEL_COLUMN
 
 
 DATA_PATH = "data/dropoff_trips_madrid.parquet"
-DROPOFF_MODEL_PATH = "services/inference-api/models/dropoff_model.joblib"
+DROPOFF_MODEL_PATH = "services/inference-api/models/dropoff_eta_model.joblib"
 
 
 def main(data_path: str = DATA_PATH, model_path: str = DROPOFF_MODEL_PATH):
