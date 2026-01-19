@@ -7,7 +7,7 @@ MAX_SPEED_KMH = 45
 
 class DropoffETAEstimator:
     """
-    Dropoff ETA estimation model.
+    Dropoff ETA estimation model using XGBoost.
     
     Predicts average travel speed based on trip distance, surge conditions,
     time of day, and whether it's a weekend. Then calculates ETA from speed.
