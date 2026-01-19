@@ -3,7 +3,7 @@ import pandas as pd
 
 def reconstruct_features(trips: pd.DataFrame) -> pd.DataFrame:
     """
-    Reconstruct ETA features from historical trip records.
+    Reconstruct pickup ETA features from historical trip records.
     Assumes features were already logged per 5m window.
     
     Args:
@@ -22,8 +22,6 @@ def reconstruct_features(trips: pd.DataFrame) -> pd.DataFrame:
         "pickup_eta_seconds",
     ]].dropna()
 
-    features["pickup_eta_seconds"] = features[
-        "pickup_eta_seconds"
-    ].clip(120, 3600)
+    features["pickup_eta_seconds"] = features["pickup_eta_seconds"].clip(120, 3600)
 
     return features
