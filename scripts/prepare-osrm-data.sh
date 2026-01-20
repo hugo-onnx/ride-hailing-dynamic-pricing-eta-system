@@ -43,10 +43,10 @@ fi
 
 if command -v podman &> /dev/null; then
     CONTAINER_CMD="podman"
-elif command -v podman &> /dev/null; then
-    CONTAINER_CMD="podman"
+elif command -v docker &> /dev/null; then
+    CONTAINER_CMD="docker"
 else
-    echo "Error: Neither podman nor podman found. Please install one."
+    echo "Error: Neither podman nor docker found. Please install one."
     exit 1
 fi
 
