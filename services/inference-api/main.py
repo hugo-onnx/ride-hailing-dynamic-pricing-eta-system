@@ -18,7 +18,9 @@ from monitoring.drift import record_feature_snapshot
 from eta.pickup_model import PickupETAEstimator
 from eta.dropoff_model import DropoffETAEstimator
 from eta.features import assemble_pickup_features, assemble_dropoff_features
+from eta.dropoff_adjust import adjust_dropoff_eta, compute_congestion_factor
 from geo.utils import haversine_km
+from routing.osrm import get_osrm_client, OSRMError
 
 logging.basicConfig(
     level=logging.INFO,
@@ -29,6 +31,7 @@ logger = logging.getLogger(__name__)
 redis_client: redis.Redis | None = None
 pickup_model: PickupETAEstimator | None = None
 dropoff_model: DropoffETAEstimator | None = None
+osrm_available: bool = False
 
 PICKUP_MODEL_PATH = "/app/models/pickup_eta_model.joblib"
 DROPOFF_MODEL_PATH = "/app/models/dropoff_eta_model.joblib"
@@ -37,7 +40,7 @@ DROPOFF_MODEL_PATH = "/app/models/dropoff_eta_model.joblib"
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage Redis connection lifecycle."""
-    global redis_client, pickup_model, dropoff_model
+    global redis_client, pickup_model, dropoff_model, osrm_available
     
     redis_client = redis.Redis(
         host=REDIS_HOST,
@@ -74,6 +77,17 @@ async def lifespan(app: FastAPI):
         logger.error(f"Failed to load Dropoff model: {e}")
         dropoff_model = None
 
+    try:
+        osrm_client = get_osrm_client()
+        osrm_available = osrm_client.health_check()
+        if osrm_available:
+            logger.info("OSRM routing service is available")
+        else:
+            logger.warning("OSRM routing service is not available, falling back to haversine distance")
+    except Exception as e:
+        logger.warning(f"Could not connect to OSRM: {e}")
+        osrm_available = False
+
     yield
     
     if redis_client:
@@ -94,7 +108,14 @@ def health():
     """Health check endpoint."""
     try:
         redis_client.ping()
-        return {"status": "ok", "redis": "connected"}
+        
+        osrm_status = "connected" if osrm_available else "unavailable"
+        
+        return {
+            "status": "ok",
+            "redis": "connected",
+            "osrm": osrm_status,
+        }
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"Redis unhealthy: {e}")
 
@@ -384,6 +405,54 @@ def eta_quote(
     }
 
 
+@app.get("/v1/route")
+def get_route(
+    origin_lat: float,
+    origin_lng: float,
+    dest_lat: float,
+    dest_lng: float,
+):
+    """
+    Get route information between two points using OSRM.
+    
+    Returns road network distance and free-flow duration.
+    Falls back to haversine distance if OSRM is unavailable.
+    
+    Args:
+        origin_lat, origin_lng: Origin coordinates
+        dest_lat, dest_lng: Destination coordinates
+    
+    Returns:
+        Route distance (km) and duration (minutes)
+    """
+    osrm_client = get_osrm_client()
+    
+    try:
+        route = osrm_client.get_route(
+            origin=(origin_lng, origin_lat),
+            destination=(dest_lng, dest_lat),
+        )
+        return {
+            "source": "osrm",
+            "distance_km": round(route.distance_km, 2),
+            "duration_min": round(route.duration_min, 1),
+            "duration_s": round(route.duration_s, 0),
+        }
+    except OSRMError as e:
+        # Fallback to haversine
+        distance_km = haversine_km(origin_lat, origin_lng, dest_lat, dest_lng)
+        # Estimate duration assuming 30 km/h average speed
+        duration_min = (distance_km / 30) * 60
+        
+        return {
+            "source": "haversine_fallback",
+            "distance_km": round(distance_km, 2),
+            "duration_min": round(duration_min, 1),
+            "duration_s": round(duration_min * 60, 0),
+            "warning": f"OSRM unavailable: {e}",
+        }
+
+
 @app.post("/v1/quote")
 def trip_quote(
     origin_lat: float,
@@ -393,10 +462,13 @@ def trip_quote(
     timestamp: str | None = None,
 ):
     """
-    Get a complete trip quote with ETA and pricing.
+    Get a complete trip quote with ETA and pricing using OSRM routing.
     
-    Combines pickup ETA, dropoff ETA, and dynamic pricing for a full
-    trip estimate from origin to destination.
+    Combines:
+    - OSRM routing for accurate road network distance and duration
+    - Pickup ETA prediction (ML model)
+    - Dropoff ETA with congestion adjustment
+    - Dynamic pricing based on market conditions
     
     Args:
         origin_lat, origin_lng: Pickup location coordinates
@@ -404,12 +476,12 @@ def trip_quote(
         timestamp: Optional ISO timestamp (defaults to now)
     
     Returns:
-        Complete trip quote with ETAs and pricing
+        Complete trip quote with route info, ETAs and pricing
     """
-    if pickup_model is None or dropoff_model is None:
+    if pickup_model is None:
         raise HTTPException(
             status_code=503, 
-            detail="ETA models not loaded. Please ensure model files exist."
+            detail="Pickup ETA model not loaded. Please ensure model file exists."
         )
     
     start = time.perf_counter()
@@ -430,10 +502,25 @@ def trip_quote(
         h3_origin = h3.latlng_to_cell(origin_lat, origin_lng, 8)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid origin coordinates: {e}")
+
+    # --- ROUTING (OSRM with fallback) ---
+    osrm_client = get_osrm_client()
+    routing_source = "osrm"
     
-    trip_distance_km = haversine_km(
-        origin_lat, origin_lng, dest_lat, dest_lng
-    )
+    try:
+        route = osrm_client.get_route(
+            origin=(origin_lng, origin_lat),
+            destination=(dest_lng, dest_lat),
+        )
+        trip_distance_km = route.distance_km
+        osrm_duration_s = route.duration_s
+    except OSRMError as e:
+        # Fallback to haversine distance
+        logger.warning(f"OSRM unavailable, using haversine fallback: {e}")
+        routing_source = "haversine_fallback"
+        trip_distance_km = haversine_km(origin_lat, origin_lng, dest_lat, dest_lng)
+        # Estimate free-flow duration assuming 35 km/h average
+        osrm_duration_s = (trip_distance_km / 35) * 3600
     
     if trip_distance_km < 0.1:
         raise HTTPException(status_code=400, detail="Origin and destination too close")
@@ -448,28 +535,28 @@ def trip_quote(
     )
     features_5m = derive_features(raw_5m)
 
-    # --- PICKUP ETA ---
+    # --- PICKUP ETA (ML) ---
     pickup_features = assemble_pickup_features(
         trip_distance_km=trip_distance_km,
         features_5m=features_5m,
     )
     pickup_eta = pickup_model.predict(pickup_features)
 
-    # --- DROPOFF ETA ---
-    dropoff_features = assemble_dropoff_features(
-        trip_distance_km=trip_distance_km,
-        features_5m=features_5m,
-        ts=ts,
+    # --- DROPOFF ETA (OSRM + Congestion Adjustment) ---
+    surge_pressure = features_5m["surge_pressure"]
+    dropoff_eta = adjust_dropoff_eta(
+        osrm_duration_s=osrm_duration_s,
+        surge_pressure=surge_pressure,
     )
-    dropoff_eta = dropoff_model.predict(dropoff_features)
+    congestion_factor = compute_congestion_factor(surge_pressure)
 
     # --- TOTAL ETA ---
     total_eta = pickup_eta + dropoff_eta
 
     # --- PRICING ---
     pricing = compute_price_multiplier(features_5m)
-    base_fare = 1.2  # EUR
-    price_per_km = 1.1  # EUR/km
+    base_fare = 1.5  # EUR
+    price_per_km = 1.2  # EUR/km
     price = (base_fare + trip_distance_km * price_per_km) * pricing["multiplier"]
 
     # --- MONITORING ---
@@ -479,10 +566,16 @@ def trip_quote(
     return {
         "city": CITY,
         "h3_origin": h3_origin,
-        "trip_distance_km": round(trip_distance_km, 2),
+        "route": {
+            "source": routing_source,
+            "distance_km": round(trip_distance_km, 2),
+            "osrm_duration_min": round(osrm_duration_s / 60, 1),
+        },
         "eta": {
             "pickup_seconds": int(pickup_eta),
             "dropoff_seconds": int(dropoff_eta),
+            "dropoff_free_flow_seconds": int(osrm_duration_s),
+            "congestion_factor": round(congestion_factor, 2),
             "total_seconds": int(total_eta),
             "total_minutes": round(total_eta / 60, 1),
         },
