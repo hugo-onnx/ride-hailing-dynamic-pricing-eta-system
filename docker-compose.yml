@@ -28,6 +28,26 @@ services:
     ports:
       - "6379:6379"
 
+  osrm:
+    image: osrm/osrm-backend
+    platform: linux/amd64
+    container_name: osrm
+    ports:
+      - "5001:5000"
+    volumes:
+      - ./osrm-data:/data
+    command: >
+      osrm-routed
+      --algorithm mld
+      /data/madrid-latest.osrm
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:5000/route/v1/driving/-3.7038,40.4168;-3.7038,40.4169 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
   event-producer:
     build:
       context: .
@@ -60,9 +80,12 @@ services:
     container_name: inference-api
     depends_on:
       - redis
+      - osrm
     environment:
       - REDIS_HOST=redis
       - REDIS_PORT=6379
+      - OSRM_HOST=http://osrm:5000
+      - OSRM_TIMEOUT=2.0
     ports:
       - "8000:8000"
     restart: unless-stopped
