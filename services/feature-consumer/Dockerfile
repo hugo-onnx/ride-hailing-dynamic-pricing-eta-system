@@ -16,4 +16,6 @@ COPY services/feature-consumer/main.py /app/services/feature-consumer/main.py
 
 ENV PYTHONPATH=/app
 
+EXPOSE 8002
+
 CMD ["python", "services/feature-consumer/main.py"]

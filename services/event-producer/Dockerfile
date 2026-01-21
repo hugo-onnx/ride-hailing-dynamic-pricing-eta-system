@@ -16,4 +16,6 @@ COPY services/event-producer/main.py /app/services/event-producer/main.py
 
 ENV PYTHONPATH=/app
 
+EXPOSE 8001
+
 CMD ["python", "services/event-producer/main.py"]
