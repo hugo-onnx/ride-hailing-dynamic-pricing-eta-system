@@ -20,7 +20,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Kafka configuration
 KAFKA_CONFIG = {
     "bootstrap.servers": KAFKA_BOOTSTRAP_SERVERS,
     "group.id": f"{CITY}-feature-service",
@@ -33,27 +32,15 @@ KAFKA_CONFIG = {
     "queued.max.messages.kbytes": 65536,
 }
 
-# Topics
 RIDE_TOPIC = f"rides.requested.{CITY}"
 DRIVER_TOPIC = f"drivers.location.{CITY}"
 TOPICS = [RIDE_TOPIC, DRIVER_TOPIC]
-
-# Feature configuration
 WINDOWS_MINUTES = [1, 5, 15]
 AVG_IDLE_SPEED_KMH = 12
-
-# Batching configuration
 BATCH_SIZE = 100
 BATCH_TIMEOUT_MS = 200
-
-# Metrics port
 METRICS_PORT = 8002
 
-# =============================================================================
-# PROMETHEUS METRICS
-# =============================================================================
-
-# Counters
 EVENTS_CONSUMED = Counter(
     'feature_consumer_events_consumed_total',
     'Total events consumed from Kafka',
@@ -84,7 +71,6 @@ FLUSHES = Counter(
     ['city']
 )
 
-# Gauges
 BATCH_PENDING_EVENTS = Gauge(
     'feature_consumer_batch_pending_events',
     'Number of events pending in batch',
@@ -103,7 +89,6 @@ CONSUMER_LAG = Gauge(
     ['city']
 )
 
-# Histograms
 FLUSH_DURATION = Histogram(
     'feature_consumer_flush_duration_seconds',
     'Time taken to flush batch to Redis',
@@ -118,7 +103,6 @@ EVENT_PROCESSING_TIME = Histogram(
     buckets=[0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05]
 )
 
-# Summary
 EVENTS_PER_FLUSH = Summary(
     'feature_consumer_events_per_flush',
     'Number of events per flush',
@@ -222,7 +206,6 @@ class FeatureAggregator:
             if ts.tzinfo is None:
                 ts = ts.replace(tzinfo=timezone.utc)
             
-            # Calculate lag
             lag = (datetime.now(timezone.utc) - ts).total_seconds()
             CONSUMER_LAG.labels(city=CITY).set(lag)
             
@@ -347,8 +330,7 @@ class FeatureAggregator:
                 keys_updated += 1
             
             pipe.execute()
-            
-            # Record metrics
+
             flush_duration = time.time() - flush_start
             FLUSH_DURATION.labels(city=CITY).observe(flush_duration)
             FLUSHES.labels(city=CITY).inc()
@@ -356,13 +338,11 @@ class FeatureAggregator:
             KEYS_PER_FLUSH.labels(city=CITY).observe(keys_updated)
             REDIS_OPERATIONS.labels(city=CITY, operation="pipeline_execute").inc()
             
-            # Reset state
             flushed_events = self.events_since_flush
             self.pending_updates.clear()
             self.events_since_flush = 0
             self.last_flush = time.time()
             
-            # Update gauges
             BATCH_PENDING_EVENTS.labels(city=CITY).set(0)
             BATCH_PENDING_KEYS.labels(city=CITY).set(0)
             
@@ -381,7 +361,6 @@ class FeatureAggregator:
 
 def main():
     """Main consumer loop with batched processing and metrics"""
-    # Start Prometheus metrics server
     start_http_server(METRICS_PORT)
     logger.info(f"Prometheus metrics server started on port {METRICS_PORT}")
     
@@ -451,7 +430,6 @@ def main():
                 
                 aggregator.update_pending_metrics()
                 
-                # Log every 10 seconds
                 if time.time() - last_log_time >= 10:
                     elapsed = time.time() - start_time
                     logger.info(
