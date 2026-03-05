@@ -27,7 +27,7 @@ class PickupETAEstimator:
                 - supply_demand_ratio
                 - surge_pressure
                 - deadhead_km_avg
-                - available_drivers
+                - idle_drivers
                 - ride_requests
         
         Returns:
@@ -38,7 +38,7 @@ class PickupETAEstimator:
             features["supply_demand_ratio"],
             features["surge_pressure"],
             features["deadhead_km_avg"],
-            features["available_drivers"],
+            features["idle_drivers"],
             features["ride_requests"],
         ]])
 
