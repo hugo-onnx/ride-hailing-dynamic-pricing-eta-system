@@ -55,8 +55,11 @@ services:
     container_name: event-producer
     depends_on:
       - kafka
+      - redis
     environment:
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
     ports:
       - "8001:8001"
     restart: unless-stopped
@@ -92,6 +95,21 @@ services:
       - OSRM_TIMEOUT=2.0
     ports:
       - "8000:8000"
+    restart: unless-stopped
+
+  visualization:
+    build:
+      context: .
+      dockerfile: services/visualization/Dockerfile
+    container_name: visualization
+    depends_on:
+      - redis
+      - feature-consumer
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    ports:
+      - "8003:8003"
     restart: unless-stopped
   
   prometheus:
