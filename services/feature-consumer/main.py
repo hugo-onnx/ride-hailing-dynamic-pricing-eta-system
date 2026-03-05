@@ -175,19 +175,37 @@ def wait_for_topics(consumer: Consumer, topics: list[str], timeout: int = 120):
         raise TimeoutError(f"Topics {pending_topics} not available after {timeout}s")
 
 
+def _window_key_is_expired(window_key: str, now: datetime) -> bool:
+    """Return True if the window embedded in a Redis key has fully elapsed."""
+    try:
+        # Key format: {city}:{h3}:{N}m:{iso_timestamp}
+        parts = window_key.split(":")
+        window_minutes = int(parts[2].rstrip("m"))
+        # Timestamp portion may contain colons (ISO format), rejoin from index 3
+        ts = datetime.fromisoformat(":".join(parts[3:]))
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        return (now - ts).total_seconds() > window_minutes * 60
+    except Exception:
+        return False
+
+
 class FeatureAggregator:
     """Batches feature updates and flushes to Redis efficiently"""
-    
+
     def __init__(self, redis_client: redis.Redis):
         self.redis = redis_client
         self.pending_updates: dict[str, dict] = defaultdict(lambda: {
             "ride_requests": 0,
-            "available_drivers": 0,
-            "active_drivers": 0,
+            "idle_drivers": 0,
+            "on_trip_drivers": 0,
             "deadhead_km_sum": 0.0,
             "idle_events": 0,
             "metadata": None,
         })
+        # Tracks which driver IDs have already been counted per window key.
+        # Prevents each 5-second location ping from inflating driver counts.
+        self.seen_drivers: dict[str, set[str]] = defaultdict(set)
         self.last_flush = time.time()
         self.events_since_flush = 0
     
@@ -239,33 +257,42 @@ class FeatureAggregator:
             h3_index = event.get("h3_res8")
             timestamp_str = event.get("timestamp")
             status = event.get("status")
+            driver_id = event.get("driver_id")
             idle_seconds = event.get("idle_seconds", 0)
-            
+
             if not h3_index or not timestamp_str:
                 PROCESSING_ERRORS.labels(city=CITY, type="driver", error_type="missing_field").inc()
                 return False
-            
+
             ts = datetime.fromisoformat(timestamp_str)
             if ts.tzinfo is None:
                 ts = ts.replace(tzinfo=timezone.utc)
-            
+
             deadhead_km = (
                 idle_seconds * AVG_IDLE_SPEED_KMH / 3600
                 if status == "available"
                 else 0
             )
-            
+
             for window in WINDOWS_MINUTES:
                 window_start = floor_timestamp(ts, window)
                 window_key = f"{CITY}:{h3_index}:{window}m:{window_start.isoformat()}"
-                
+
+                # Each driver is counted at most once per window bucket.
+                # Without this guard every 5-second ping would inflate counts.
+                dedup_key = f"{window_key}:{driver_id}"
+                if driver_id and dedup_key in self.seen_drivers[window_key]:
+                    continue
+                if driver_id:
+                    self.seen_drivers[window_key].add(dedup_key)
+
                 if status == "available":
-                    self.pending_updates[window_key]["available_drivers"] += 1
+                    self.pending_updates[window_key]["idle_drivers"] += 1
                     self.pending_updates[window_key]["deadhead_km_sum"] += deadhead_km
                     self.pending_updates[window_key]["idle_events"] += 1
                 else:
-                    self.pending_updates[window_key]["active_drivers"] += 1
-                
+                    self.pending_updates[window_key]["on_trip_drivers"] += 1
+
                 if self.pending_updates[window_key]["metadata"] is None:
                     self.pending_updates[window_key]["metadata"] = {
                         "window_minutes": window,
@@ -273,11 +300,11 @@ class FeatureAggregator:
                         "window_start": window_start.isoformat(),
                         "ttl": window_ttl_seconds(window),
                     }
-            
+
             self.events_since_flush += 1
             EVENT_PROCESSING_TIME.labels(city=CITY, type="driver").observe(time.time() - start_time)
             return True
-            
+
         except Exception as e:
             PROCESSING_ERRORS.labels(city=CITY, type="driver", error_type="exception").inc()
             logger.error(f"Error adding driver event: {e}")
@@ -310,11 +337,11 @@ class FeatureAggregator:
                 if updates["ride_requests"] > 0:
                     pipe.hincrby(window_key, "ride_requests", updates["ride_requests"])
                 
-                if updates["available_drivers"] > 0:
-                    pipe.hincrby(window_key, "available_drivers", updates["available_drivers"])
-                
-                if updates["active_drivers"] > 0:
-                    pipe.hincrby(window_key, "active_drivers", updates["active_drivers"])
+                if updates["idle_drivers"] > 0:
+                    pipe.hincrby(window_key, "idle_drivers", updates["idle_drivers"])
+
+                if updates["on_trip_drivers"] > 0:
+                    pipe.hincrby(window_key, "on_trip_drivers", updates["on_trip_drivers"])
                 
                 if updates["deadhead_km_sum"] > 0:
                     pipe.hincrbyfloat(window_key, "deadhead_km_sum", updates["deadhead_km_sum"])
@@ -339,6 +366,17 @@ class FeatureAggregator:
             REDIS_OPERATIONS.labels(city=CITY, operation="pipeline_execute").inc()
             
             flushed_events = self.events_since_flush
+            # Prune seen_drivers for window keys whose window has rolled over.
+            # Window keys embed the window start timestamp; once that slot is in
+            # the past by more than the largest window (15 min), it is truly stale.
+            now_ts = datetime.now(timezone.utc)
+            stale = [
+                k for k in list(self.seen_drivers.keys())
+                if k not in self.pending_updates
+                and _window_key_is_expired(k, now_ts)
+            ]
+            for k in stale:
+                del self.seen_drivers[k]
             self.pending_updates.clear()
             self.events_since_flush = 0
             self.last_flush = time.time()
