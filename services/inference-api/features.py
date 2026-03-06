@@ -2,6 +2,8 @@ from datetime import datetime, timezone, timedelta
 
 import redis
 
+from monitoring.metrics import record_feature_freshness
+
 WINDOWS = [1, 5, 15]
 
 
@@ -52,8 +54,14 @@ def fetch_window(
 
     data = redis_client.hgetall(key)
     if data:
+        delay_sec = int((ts - window_start).total_seconds())
+        record_feature_freshness(redis_client, window, delay_sec)
         return data
 
     prev_start = window_start - timedelta(minutes=window)
     prev_key = redis_key(city, h3_index, window, prev_start)
-    return redis_client.hgetall(prev_key)
+    result = redis_client.hgetall(prev_key)
+    if result:
+        delay_sec = int((ts - prev_start).total_seconds())
+        record_feature_freshness(redis_client, window, delay_sec)
+    return result
