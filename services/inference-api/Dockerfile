@@ -10,9 +10,12 @@ RUN uv pip install --system --no-cache .
 
 COPY services/common /app/services/common
 COPY services/inference-api/main.py /app/main.py
+COPY services/inference-api/schemas.py /app/schemas.py
+COPY services/inference-api/dependencies.py /app/dependencies.py
 COPY services/inference-api/features.py /app/features.py
 COPY services/inference-api/derive.py /app/derive.py
 COPY services/inference-api/pricing.py /app/pricing.py
+COPY services/inference-api/routers /app/routers
 COPY services/inference-api/monitoring /app/monitoring
 COPY services/inference-api/eta /app/eta
 COPY services/inference-api/geo /app/geo
