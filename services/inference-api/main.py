@@ -13,7 +13,15 @@ from services.common.config import REDIS_HOST, REDIS_PORT, CITY
 from features import fetch_window, WINDOWS
 from derive import derive_features
 from pricing import compute_price_multiplier
-from monitoring.metrics import record_latency
+from monitoring.metrics import (
+    record_latency,
+    metrics_app,
+    REQUEST_COUNTER,
+    REQUEST_LATENCY,
+    FEATURE_FETCH_LATENCY,
+    MODEL_INFERENCE_LATENCY,
+    OSRM_FALLBACK_COUNTER,
+)
 from monitoring.drift import record_feature_snapshot
 from eta.pickup_model import PickupETAEstimator
 from eta.dropoff_model import DropoffETAEstimator
@@ -101,6 +109,8 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+
+app.mount("/metrics", metrics_app)
 
 
 @app.get("/health")
@@ -230,15 +240,15 @@ def pricing_quote(
 ):
     """
     Get a dynamic pricing quote for a location.
-    
+
     Uses 5-minute window features to compute surge pricing multiplier.
     Includes monitoring for latency and feature drift.
-    
+
     Args:
         lat: Latitude
         lng: Longitude
         timestamp: Optional ISO timestamp (defaults to now)
-    
+
     Returns:
         Pricing quote with multiplier and feature breakdown
     """
@@ -248,18 +258,21 @@ def pricing_quote(
         try:
             ts = datetime.fromisoformat(timestamp)
         except ValueError:
+            REQUEST_COUNTER.labels(endpoint="pricing_quote", status="400").inc()
             raise HTTPException(status_code=400, detail="Invalid timestamp format")
     else:
         ts = datetime.now(timezone.utc)
-    
+
     if ts.tzinfo is None:
         ts = ts.replace(tzinfo=timezone.utc)
 
     try:
         h3_index = h3.latlng_to_cell(lat, lng, 8)
     except Exception as e:
+        REQUEST_COUNTER.labels(endpoint="pricing_quote", status="400").inc()
         raise HTTPException(status_code=400, detail=f"Invalid coordinates: {e}")
 
+    feature_start = time.perf_counter()
     raw_5m = fetch_window(
         redis_client=redis_client,
         city=CITY,
@@ -267,6 +280,7 @@ def pricing_quote(
         window=5,
         ts=ts,
     )
+    FEATURE_FETCH_LATENCY.labels(endpoint="pricing_quote").observe(time.perf_counter() - feature_start)
 
     features_5m = derive_features(raw_5m)
     pricing = compute_price_multiplier(features_5m)
@@ -279,6 +293,8 @@ def pricing_quote(
 
     latency_ms = (time.perf_counter() - start) * 1000
     record_latency(redis_client, "pricing", latency_ms)
+    REQUEST_LATENCY.labels(endpoint="pricing_quote").observe(latency_ms / 1000)
+    REQUEST_COUNTER.labels(endpoint="pricing_quote", status="200").inc()
 
     return {
         "city": CITY,
@@ -352,29 +368,33 @@ def eta_quote(
         ETA prediction in seconds and minutes with latency
     """
     if pickup_model is None:
+        REQUEST_COUNTER.labels(endpoint="eta_quote", status="503").inc()
         raise HTTPException(
-            status_code=503, 
+            status_code=503,
             detail="ETA model not loaded. Please ensure model file exists."
         )
-    
+
     start = time.perf_counter()
 
     if timestamp:
         try:
             ts = datetime.fromisoformat(timestamp)
         except ValueError:
+            REQUEST_COUNTER.labels(endpoint="eta_quote", status="400").inc()
             raise HTTPException(status_code=400, detail="Invalid timestamp format")
     else:
         ts = datetime.now(timezone.utc)
-    
+
     if ts.tzinfo is None:
         ts = ts.replace(tzinfo=timezone.utc)
 
     try:
         h3_index = h3.latlng_to_cell(lat, lng, 8)
     except Exception as e:
+        REQUEST_COUNTER.labels(endpoint="eta_quote", status="400").inc()
         raise HTTPException(status_code=400, detail=f"Invalid coordinates: {e}")
 
+    feature_start = time.perf_counter()
     raw_5m = fetch_window(
         redis_client=redis_client,
         city=CITY,
@@ -382,6 +402,7 @@ def eta_quote(
         window=5,
         ts=ts,
     )
+    FEATURE_FETCH_LATENCY.labels(endpoint="eta_quote").observe(time.perf_counter() - feature_start)
 
     features_5m = derive_features(raw_5m)
 
@@ -390,10 +411,14 @@ def eta_quote(
         features_5m=features_5m,
     )
 
+    model_start = time.perf_counter()
     eta_seconds = pickup_model.predict(eta_features)
+    MODEL_INFERENCE_LATENCY.labels(model="pickup_eta").observe(time.perf_counter() - model_start)
 
     latency_ms = (time.perf_counter() - start) * 1000
     record_latency(redis_client, "eta", latency_ms)
+    REQUEST_LATENCY.labels(endpoint="eta_quote").observe(latency_ms / 1000)
+    REQUEST_COUNTER.labels(endpoint="eta_quote", status="200").inc()
 
     return {
         "city": CITY,
@@ -479,21 +504,23 @@ def trip_quote(
         Complete trip quote with route info, ETAs and pricing
     """
     if pickup_model is None:
+        REQUEST_COUNTER.labels(endpoint="trip_quote", status="503").inc()
         raise HTTPException(
-            status_code=503, 
+            status_code=503,
             detail="Pickup ETA model not loaded. Please ensure model file exists."
         )
-    
+
     start = time.perf_counter()
 
     if timestamp:
         try:
             ts = datetime.fromisoformat(timestamp)
         except ValueError:
+            REQUEST_COUNTER.labels(endpoint="trip_quote", status="400").inc()
             raise HTTPException(status_code=400, detail="Invalid timestamp format")
     else:
         ts = datetime.now(timezone.utc)
-    
+
     if ts.tzinfo is None:
         ts = ts.replace(tzinfo=timezone.utc)
 
@@ -501,12 +528,13 @@ def trip_quote(
     try:
         h3_origin = h3.latlng_to_cell(origin_lat, origin_lng, 8)
     except Exception as e:
+        REQUEST_COUNTER.labels(endpoint="trip_quote", status="400").inc()
         raise HTTPException(status_code=400, detail=f"Invalid origin coordinates: {e}")
 
     # --- ROUTING (OSRM with fallback) ---
     osrm_client = get_osrm_client()
     routing_source = "osrm"
-    
+
     try:
         route = osrm_client.get_route(
             origin=(origin_lng, origin_lat),
@@ -518,14 +546,17 @@ def trip_quote(
         # Fallback to haversine distance
         logger.warning(f"OSRM unavailable, using haversine fallback: {e}")
         routing_source = "haversine_fallback"
+        OSRM_FALLBACK_COUNTER.inc()
         trip_distance_km = haversine_km(origin_lat, origin_lng, dest_lat, dest_lng)
         # Estimate free-flow duration assuming 35 km/h average
         osrm_duration_s = (trip_distance_km / 35) * 3600
-    
+
     if trip_distance_km < 0.1:
+        REQUEST_COUNTER.labels(endpoint="trip_quote", status="400").inc()
         raise HTTPException(status_code=400, detail="Origin and destination too close")
 
     # --- FEATURES ---
+    feature_start = time.perf_counter()
     raw_5m = fetch_window(
         redis_client=redis_client,
         city=CITY,
@@ -533,6 +564,7 @@ def trip_quote(
         window=5,
         ts=ts,
     )
+    FEATURE_FETCH_LATENCY.labels(endpoint="trip_quote").observe(time.perf_counter() - feature_start)
     features_5m = derive_features(raw_5m)
 
     # --- PICKUP ETA (ML) ---
@@ -540,7 +572,9 @@ def trip_quote(
         trip_distance_km=trip_distance_km,
         features_5m=features_5m,
     )
+    model_start = time.perf_counter()
     pickup_eta = pickup_model.predict(pickup_features)
+    MODEL_INFERENCE_LATENCY.labels(model="pickup_eta").observe(time.perf_counter() - model_start)
 
     # --- DROPOFF ETA (OSRM + Congestion Adjustment) ---
     surge_pressure = features_5m["surge_pressure"]
@@ -562,6 +596,8 @@ def trip_quote(
     # --- MONITORING ---
     latency_ms = (time.perf_counter() - start) * 1000
     record_latency(redis_client, "trip_quote", latency_ms)
+    REQUEST_LATENCY.labels(endpoint="trip_quote").observe(latency_ms / 1000)
+    REQUEST_COUNTER.labels(endpoint="trip_quote", status="200").inc()
 
     return {
         "city": CITY,
