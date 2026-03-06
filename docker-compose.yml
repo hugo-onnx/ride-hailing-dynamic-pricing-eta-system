@@ -112,6 +112,24 @@ services:
       - "8003:8003"
     restart: unless-stopped
   
+  rider-app:
+    build:
+      context: .
+      dockerfile: services/rider-app/Dockerfile
+    container_name: rider-app
+    depends_on:
+      - redis
+      - inference-api
+      - osrm
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - INFERENCE_API_URL=http://inference-api:8000
+      - OSRM_HOST=http://osrm:5000
+    ports:
+      - "8004:8004"
+    restart: unless-stopped
+
   prometheus:
     image: prom/prometheus:v2.50.1
     container_name: prometheus
