@@ -273,14 +273,19 @@ def get_time_weighted_driver(hour: int) -> list[float]:
 
 def sample_urban_background() -> tuple[float, float]:
     """Uniform random point within the urban extent (rejection sampling).
-    Rejects points > 6 km from every zone to avoid rural/empty areas."""
+    Rejects points > 6 km from every zone to avoid rural/empty areas.
+    Falls back to a random point within bounds after 1000 failed attempts."""
     max_dist = 0.055
-    while True:
+    for _ in range(1000):
         lat = random.uniform(MADRID_BOUNDS["lat_min"], MADRID_BOUNDS["lat_max"])
         lng = random.uniform(MADRID_BOUNDS["lng_min"], MADRID_BOUNDS["lng_max"])
         for zone in MADRID_ZONES:
             if math.sqrt((lat - zone.lat) ** 2 + (lng - zone.lng) ** 2) < max_dist:
                 return lat, lng
+    return (
+        random.uniform(MADRID_BOUNDS["lat_min"], MADRID_BOUNDS["lat_max"]),
+        random.uniform(MADRID_BOUNDS["lng_min"], MADRID_BOUNDS["lng_max"]),
+    )
 
 
 def normalize_weights(zones: list[Zone], attr: str) -> list[float]:
