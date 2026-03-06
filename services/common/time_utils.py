@@ -2,6 +2,8 @@ from datetime import datetime, timezone
 
 def floor_timestamp(ts: datetime, window_minutes: int) -> datetime:
     """Floors a timestamp to the start of its tumbling window."""
+    if window_minutes <= 0:
+        raise ValueError("window_minutes must be positive")
     if ts.tzinfo is None:
         ts = ts.replace(tzinfo=timezone.utc)
 
@@ -16,4 +18,4 @@ def floor_timestamp(ts: datetime, window_minutes: int) -> datetime:
 
 def window_ttl_seconds(window_minutes: int) -> int:
     """TTL policy: window + small buffer"""
-    return int((window_minutes * 60) * 1.4)
+    return int((window_minutes * 60) * 2.0)
