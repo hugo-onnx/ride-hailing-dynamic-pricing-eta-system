@@ -15,6 +15,7 @@ class RouteResult:
     """Result from OSRM route calculation."""
     distance_m: float
     duration_s: float
+    geometry: dict | None = None
     
     @property
     def distance_km(self) -> float:
@@ -65,7 +66,8 @@ class OSRMClient:
         url = f"{self.host}/route/v1/driving/{coords}"
         
         params = {
-            "overview": "false",
+            "overview": "full",
+            "geometries": "geojson",
             "annotations": "false",
         }
         
@@ -97,6 +99,7 @@ class OSRMClient:
         return RouteResult(
             distance_m=route["distance"],
             duration_s=route["duration"],
+            geometry=route.get("geometry"),
         )
     
     def health_check(self) -> bool:
