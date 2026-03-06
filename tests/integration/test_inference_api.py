@@ -39,26 +39,26 @@ def _make_dropoff_model(return_value=600.0):
 
 @pytest.fixture
 def client_with_redis(fake_redis):
-    """TestClient with fakeredis injected as the global redis_client."""
-    m.redis_client = fake_redis
-    m.pickup_model = None
-    m.dropoff_model = None
-    m.osrm_available = False
+    """TestClient with fakeredis injected into app.state."""
+    m.app.state.redis_client = fake_redis
+    m.app.state.pickup_model = None
+    m.app.state.dropoff_model = None
+    m.app.state.osrm_available = False
     yield TestClient(m.app)
-    m.redis_client = None
+    m.app.state.redis_client = None
 
 
 @pytest.fixture
 def client_with_models(fake_redis):
     """TestClient with fakeredis and mock ML models."""
-    m.redis_client = fake_redis
-    m.pickup_model = _make_pickup_model()
-    m.dropoff_model = _make_dropoff_model()
-    m.osrm_available = False
+    m.app.state.redis_client = fake_redis
+    m.app.state.pickup_model = _make_pickup_model()
+    m.app.state.dropoff_model = _make_dropoff_model()
+    m.app.state.osrm_available = False
     yield TestClient(m.app)
-    m.redis_client = None
-    m.pickup_model = None
-    m.dropoff_model = None
+    m.app.state.redis_client = None
+    m.app.state.pickup_model = None
+    m.app.state.dropoff_model = None
 
 
 class TestHealthEndpoint:
@@ -68,7 +68,7 @@ class TestHealthEndpoint:
         assert resp.json()["status"] == "ok"
 
     def test_health_503_when_redis_none(self):
-        m.redis_client = None
+        m.app.state.redis_client = None
         client = TestClient(m.app)
         resp = client.get("/health")
         assert resp.status_code == 503
@@ -171,18 +171,18 @@ class TestTripQuoteEndpoint:
         assert resp.status_code == 503
 
     def test_trip_quote_503_when_dropoff_model_not_loaded(self, fake_redis):
-        m.redis_client = fake_redis
-        m.pickup_model = _make_pickup_model()
-        m.dropoff_model = None
-        m.osrm_available = False
+        m.app.state.redis_client = fake_redis
+        m.app.state.pickup_model = _make_pickup_model()
+        m.app.state.dropoff_model = None
+        m.app.state.osrm_available = False
         client = TestClient(m.app)
         resp = client.post(
             "/v1/quote?origin_lat=40.4169&origin_lng=-3.7034"
             "&dest_lat=40.4722&dest_lng=-3.6824"
         )
         assert resp.status_code == 503
-        m.redis_client = None
-        m.pickup_model = None
+        m.app.state.redis_client = None
+        m.app.state.pickup_model = None
 
     def test_trip_quote_returns_complete_response(self, client_with_models):
         resp = client_with_models.post(
