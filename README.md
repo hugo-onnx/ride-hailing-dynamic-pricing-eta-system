@@ -1,7 +1,7 @@
 WORK IN PROGRESS
 
 Sneak peek:
-![Madrid requests/drivers](images/madashboard.png)
+![Madrid requests/drivers](images/dashboard.png)
 
 Resources:
 [H3: Hexagonal Hierarchical Spatial Index](https://www.uber.com/en-ES/blog/h3/)
