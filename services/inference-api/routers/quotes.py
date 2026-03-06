@@ -83,6 +83,7 @@ def trip_quote(
     osrm_client = get_osrm_client()
     routing_source = "osrm"
 
+    route_geometry = None
     try:
         route = osrm_client.get_route(
             origin=(origin_lng, origin_lat),
@@ -90,6 +91,7 @@ def trip_quote(
         )
         trip_distance_km = route.distance_km
         osrm_duration_s = route.duration_s
+        route_geometry = route.geometry
     except OSRMError as e:
         logger.warning(f"OSRM unavailable, using haversine fallback: {e}")
         routing_source = "haversine_fallback"
@@ -152,6 +154,7 @@ def trip_quote(
             "source": routing_source,
             "distance_km": round(trip_distance_km, 2),
             "osrm_duration_min": round(osrm_duration_s / 60, 1),
+            "geometry": route_geometry,
         },
         "eta": {
             "pickup_seconds": int(pickup_eta),
