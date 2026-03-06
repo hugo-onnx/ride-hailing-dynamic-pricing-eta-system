@@ -1,8 +1,45 @@
-import time
 from datetime import datetime, timezone
 import redis
 
+from prometheus_client import Counter, Histogram, make_asgi_app
+
 METRIC_TTL = 3600  # 1 hour
+
+# --- Prometheus metrics ---
+
+REQUEST_COUNTER = Counter(
+    "inference_api_requests_total",
+    "Total requests to inference API endpoints",
+    ["endpoint", "status"],
+)
+
+REQUEST_LATENCY = Histogram(
+    "inference_api_request_duration_seconds",
+    "End-to-end request latency for inference API endpoints",
+    ["endpoint"],
+    buckets=[0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5],
+)
+
+FEATURE_FETCH_LATENCY = Histogram(
+    "inference_api_feature_fetch_duration_seconds",
+    "Time spent fetching features from Redis",
+    ["endpoint"],
+    buckets=[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25],
+)
+
+MODEL_INFERENCE_LATENCY = Histogram(
+    "inference_api_model_inference_duration_seconds",
+    "Time spent running ML model inference",
+    ["model"],
+    buckets=[0.001, 0.005, 0.01, 0.025, 0.05, 0.1],
+)
+
+OSRM_FALLBACK_COUNTER = Counter(
+    "inference_api_osrm_fallbacks_total",
+    "Number of times haversine fallback was used instead of OSRM",
+)
+
+metrics_app = make_asgi_app()
 
 
 def record_latency(redis_client: redis.Redis, key: str, duration_ms: float):
