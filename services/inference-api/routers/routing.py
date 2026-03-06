@@ -38,6 +38,7 @@ def get_route(
             "distance_km": round(route.distance_km, 2),
             "duration_min": round(route.duration_min, 1),
             "duration_s": round(route.duration_s, 0),
+            "geometry": route.geometry,
         }
     except OSRMError as e:
         distance_km = haversine_km(origin_lat, origin_lng, dest_lat, dest_lng)
