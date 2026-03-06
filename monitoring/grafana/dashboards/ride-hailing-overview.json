@@ -2,7 +2,7 @@
   "annotations": {
     "list": []
   },
-  "editable": true,
+  "editable": false,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 0,
   "id": null,
@@ -463,28 +463,7 @@
       },
       "fieldConfig": {
         "defaults": {
-          "color": { "mode": "palette-classic" },
-          "custom": {
-            "axisBorderShow": false,
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "",
-            "axisPlacement": "auto",
-            "barAlignment": 0,
-            "drawStyle": "bars",
-            "fillOpacity": 100,
-            "gradientMode": "none",
-            "hideFrom": { "legend": false, "tooltip": false, "viz": false },
-            "insertNulls": false,
-            "lineInterpolation": "linear",
-            "lineWidth": 1,
-            "pointSize": 5,
-            "scaleDistribution": { "type": "linear" },
-            "showPoints": "never",
-            "spanNulls": false,
-            "stacking": { "group": "A", "mode": "normal" },
-            "thresholdsStyle": { "mode": "off" }
-          },
+          "color": { "mode": "continuous-BlPu" },
           "mappings": [],
           "thresholds": {
             "mode": "absolute",
@@ -497,19 +476,26 @@
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 20 },
       "id": 9,
       "options": {
-        "legend": { "calcs": [], "displayMode": "table", "placement": "right", "showLegend": true },
-        "tooltip": { "mode": "multi", "sort": "desc" }
+        "displayMode": "gradient",
+        "minVizHeight": 10,
+        "minVizWidth": 0,
+        "namePlacement": "auto",
+        "orientation": "horizontal",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "showUnfilled": true,
+        "text": {}
       },
       "pluginVersion": "10.3.3",
       "targets": [
         {
-          "expr": "topk(10, sum by (zone) (rate(event_producer_rides_produced_total[5m]) * 300))",
+          "expr": "topk(10, sum by (zone) (increase(event_producer_rides_produced_total{zone!=\"background\"}[5m])))",
+          "instant": true,
           "legendFormat": "{{zone}}",
           "refId": "A"
         }
       ],
       "title": "Top 10 Zones by Ride Requests (5min)",
-      "type": "timeseries"
+      "type": "bargauge"
     },
     {
       "datasource": {
