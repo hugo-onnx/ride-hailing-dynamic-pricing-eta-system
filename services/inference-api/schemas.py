@@ -134,6 +134,7 @@ class RouteResponse(BaseModel):
     distance_km: float = Field(..., description="Route distance in kilometers")
     duration_min: float = Field(..., description="Estimated travel time in minutes")
     duration_s: float = Field(..., description="Estimated travel time in seconds")
+    geometry: dict | None = Field(None, description="GeoJSON LineString route geometry")
     warning: str | None = Field(None, description="Present when OSRM fallback was used")
 
 
@@ -143,6 +144,7 @@ class RouteInfo(BaseModel):
     source: RoutingSource
     distance_km: float
     osrm_duration_min: float = Field(..., description="Free-flow duration from OSRM (or estimate)")
+    geometry: dict | None = Field(None, description="GeoJSON LineString route geometry")
 
 
 class ETABreakdown(BaseModel):
