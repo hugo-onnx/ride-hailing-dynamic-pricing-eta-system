@@ -43,6 +43,7 @@ osrm_available: bool = False
 
 PICKUP_MODEL_PATH = "/app/models/pickup_eta_model.joblib"
 DROPOFF_MODEL_PATH = "/app/models/dropoff_eta_model.joblib"
+HAVERSINE_FALLBACK_SPEED_KMH = 35
 
 
 @asynccontextmanager
@@ -117,6 +118,8 @@ app.mount("/metrics", metrics_app)
 def health():
     """Health check endpoint."""
     try:
+        if redis_client is None:
+            raise HTTPException(status_code=503, detail="Redis not initialized")
         redis_client.ping()
         
         osrm_status = "connected" if osrm_available else "unavailable"
@@ -466,8 +469,7 @@ def get_route(
     except OSRMError as e:
         # Fallback to haversine
         distance_km = haversine_km(origin_lat, origin_lng, dest_lat, dest_lng)
-        # Estimate duration assuming 30 km/h average speed
-        duration_min = (distance_km / 30) * 60
+        duration_min = (distance_km / HAVERSINE_FALLBACK_SPEED_KMH) * 60
         
         return {
             "source": "haversine_fallback",
@@ -508,6 +510,13 @@ def trip_quote(
         raise HTTPException(
             status_code=503,
             detail="Pickup ETA model not loaded. Please ensure model file exists."
+        )
+
+    if dropoff_model is None:
+        REQUEST_COUNTER.labels(endpoint="trip_quote", status="503").inc()
+        raise HTTPException(
+            status_code=503,
+            detail="Dropoff ETA model not loaded. Please ensure model file exists."
         )
 
     start = time.perf_counter()
