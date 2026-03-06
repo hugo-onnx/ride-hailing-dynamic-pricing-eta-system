@@ -26,4 +26,4 @@ def haversine_km(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
         * math.sin(dlng / 2) ** 2
     )
     
-    return 2 * R * math.asin(math.sqrt(a))
+    return 2 * R * math.asin(math.sqrt(min(1.0, a)))
