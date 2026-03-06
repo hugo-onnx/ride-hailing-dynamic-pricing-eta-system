@@ -1,0 +1,136 @@
+groups:
+  - name: pipeline_health
+    interval: 30s
+    rules:
+      - alert: ConsumerLagHigh
+        expr: feature_consumer_lag_seconds > 5
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Feature consumer lag is high ({{ $value | printf \"%.1f\" }}s)"
+          description: >
+            The feature consumer is processing events more than 5 seconds behind
+            real-time for city={{ $labels.city }}. This degrades pricing and ETA
+            accuracy. Check Kafka throughput and Redis flush latency.
+
+      - alert: ConsumerLagCritical
+        expr: feature_consumer_lag_seconds > 30
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Feature consumer lag is critical ({{ $value | printf \"%.1f\" }}s)"
+          description: >
+            Consumer lag exceeds 30s for city={{ $labels.city }}. Real-time
+            features are severely stale — pricing and ETA accuracy is degraded.
+
+      - alert: ProcessingErrorRateSpiking
+        expr: >
+          sum by (city) (rate(feature_consumer_processing_errors_total[5m]))
+          /
+          sum by (city) (rate(feature_consumer_events_consumed_total[5m]))
+          > 0.01
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Feature consumer error rate above 1% (city={{ $labels.city }})"
+          description: >
+            More than 1% of consumed events are failing processing for
+            city={{ $labels.city }}. Current rate: {{ $value | printf \"%.2%%\" }}.
+            Investigate Kafka message format or missing fields.
+
+  - name: service_availability
+    interval: 30s
+    rules:
+      - alert: InferenceAPIDown
+        expr: up{job="inference-api"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Inference API is down"
+          description: >
+            The inference API has been unreachable for more than 1 minute.
+            Pricing and ETA quotes are unavailable. Check container logs.
+
+      - alert: EventProducerDown
+        expr: up{job="event-producer"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Event producer is down"
+          description: >
+            The event producer has been unreachable for more than 2 minutes.
+            No ride or driver events are being generated.
+
+      - alert: FeatureConsumerDown
+        expr: up{job="feature-consumer"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Feature consumer is down"
+          description: >
+            The feature consumer has been unreachable for more than 2 minutes.
+            Redis feature store is no longer being updated.
+
+  - name: inference_api_slo
+    interval: 30s
+    rules:
+      - alert: InferenceAPIHighLatencyP95
+        expr: >
+          histogram_quantile(0.95,
+            sum by (endpoint, le) (rate(inference_api_request_duration_seconds_bucket[5m]))
+          ) > 0.5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Inference API p95 latency above 500ms (endpoint={{ $labels.endpoint }})"
+          description: >
+            The 95th percentile latency for {{ $labels.endpoint }} has been above
+            500ms for 5 minutes. Current value: {{ $value | printf \"%.3f\" }}s.
+
+      - alert: InferenceAPIErrorRateSpiking
+        expr: >
+          sum by (endpoint) (rate(inference_api_requests_total{status=~"5.."}[5m]))
+          /
+          sum by (endpoint) (rate(inference_api_requests_total[5m]))
+          > 0.01
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Inference API 5xx error rate above 1% (endpoint={{ $labels.endpoint }})"
+          description: >
+            Error rate for {{ $labels.endpoint }} is {{ $value | humanizePercentage }}.
+            Check Redis connectivity and model loading.
+
+  - name: kafka_producer_health
+    interval: 30s
+    rules:
+      - alert: KafkaProducerErrors
+        expr: increase(event_producer_kafka_errors_total[5m]) > 10
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Kafka producer errors spiking ({{ $value | printf \"%.0f\" }} errors in 5m)"
+          description: >
+            More than 10 Kafka delivery errors in the last 5 minutes for
+            city={{ $labels.city }}, topic={{ $labels.topic }}.
+            Check Kafka broker connectivity.
+
+      - alert: EventProducerRidesStalled
+        expr: rate(event_producer_rides_produced_total[5m]) == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Event producer is not generating ride events"
+          description: >
+            No ride events have been produced for 5 minutes for city={{ $labels.city }}.
+            The simulation may have stopped or the producer crashed.
