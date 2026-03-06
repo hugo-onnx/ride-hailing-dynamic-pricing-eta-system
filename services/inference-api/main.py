@@ -1,634 +1,165 @@
-import h3
-import time
-import json
 import redis
 import logging
-import numpy as np
 
-from datetime import datetime, timezone
-from fastapi import FastAPI, HTTPException
 from contextlib import asynccontextmanager
+from fastapi import FastAPI
 
-from services.common.config import REDIS_HOST, REDIS_PORT, CITY
-from features import fetch_window, WINDOWS
-from derive import derive_features
-from pricing import compute_price_multiplier
-from monitoring.metrics import (
-    record_latency,
-    metrics_app,
-    REQUEST_COUNTER,
-    REQUEST_LATENCY,
-    FEATURE_FETCH_LATENCY,
-    MODEL_INFERENCE_LATENCY,
-    OSRM_FALLBACK_COUNTER,
-)
-from monitoring.drift import record_feature_snapshot
+from services.common.config import REDIS_HOST, REDIS_PORT
+from monitoring.metrics import metrics_app
 from eta.pickup_model import PickupETAEstimator
 from eta.dropoff_model import DropoffETAEstimator
-from eta.features import assemble_pickup_features, assemble_dropoff_features
-from eta.dropoff_adjust import adjust_dropoff_eta, compute_congestion_factor
-from geo.utils import haversine_km
-from routing.osrm import get_osrm_client, OSRMError
+from routing.osrm import get_osrm_client
+
+from routers.health import router as health_router
+from routers.features import router as features_router
+from routers.pricing import router as pricing_router
+from routers.eta import router as eta_router
+from routers.routing import router as routing_router
+from routers.quotes import router as quotes_router
+from routers.monitoring import router as monitoring_router
 
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
 
-redis_client: redis.Redis | None = None
-pickup_model: PickupETAEstimator | None = None
-dropoff_model: DropoffETAEstimator | None = None
-osrm_available: bool = False
-
 PICKUP_MODEL_PATH = "/app/models/pickup_eta_model.joblib"
 DROPOFF_MODEL_PATH = "/app/models/dropoff_eta_model.joblib"
-HAVERSINE_FALLBACK_SPEED_KMH = 35
 
+# ── OpenAPI tag metadata ─────────────────────────────────────────────────────
+
+TAGS_METADATA = [
+    {
+        "name": "System",
+        "description": "Health checks and service status.",
+    },
+    {
+        "name": "Features",
+        "description": (
+            "Real-time marketplace features aggregated from Kafka events into "
+            "Redis tumbling windows (1m / 5m / 15m). Includes supply/demand "
+            "ratio, surge pressure, and driver efficiency metrics."
+        ),
+    },
+    {
+        "name": "Pricing",
+        "description": (
+            "Dynamic surge pricing computed from real-time marketplace conditions. "
+            "Multiplier range: **1.0x** (normal) to **2.0x** (peak surge)."
+        ),
+    },
+    {
+        "name": "ETA",
+        "description": (
+            "Pickup ETA prediction powered by XGBoost. Takes trip distance "
+            "and live marketplace features as input."
+        ),
+    },
+    {
+        "name": "Routing",
+        "description": (
+            "Point-to-point routing via OSRM (Madrid road network). "
+            "Automatically falls back to haversine distance when OSRM is unavailable."
+        ),
+    },
+    {
+        "name": "Trip Quotes",
+        "description": (
+            "End-to-end trip quotes combining OSRM routing, ML-predicted ETAs, "
+            "congestion adjustment, and dynamic pricing into a single response."
+        ),
+    },
+    {
+        "name": "Monitoring",
+        "description": "Feature drift detection and observability endpoints.",
+    },
+]
+
+
+# ── Lifespan ──────────────────────────────────────────────────────────────────
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Manage Redis connection lifecycle."""
-    global redis_client, pickup_model, dropoff_model, osrm_available
-    
-    redis_client = redis.Redis(
+    app.state.redis_client = redis.Redis(
         host=REDIS_HOST,
         port=REDIS_PORT,
         decode_responses=True,
         socket_connect_timeout=5,
         socket_keepalive=True,
     )
-    
+
     try:
-        redis_client.ping()
+        app.state.redis_client.ping()
         logger.info(f"Connected to Redis at {REDIS_HOST}:{REDIS_PORT}")
     except redis.ConnectionError as e:
         logger.error(f"Failed to connect to Redis: {e}")
         raise
 
     try:
-        pickup_model = PickupETAEstimator(PICKUP_MODEL_PATH)
-        logger.info(f"Loaded ETA model from {PICKUP_MODEL_PATH}")
+        app.state.pickup_model = PickupETAEstimator(PICKUP_MODEL_PATH)
+        logger.info(f"Loaded pickup ETA model from {PICKUP_MODEL_PATH}")
     except FileNotFoundError:
-        logger.warning(f"ETA model not found at {PICKUP_MODEL_PATH}, ETA endpoint will be disabled")
-        pickup_model = None
+        logger.warning(f"Pickup ETA model not found at {PICKUP_MODEL_PATH}")
+        app.state.pickup_model = None
     except Exception as e:
-        logger.error(f"Failed to load ETA model: {e}")
-        pickup_model = None
+        logger.error(f"Failed to load pickup ETA model: {e}")
+        app.state.pickup_model = None
 
     try:
-        dropoff_model = DropoffETAEstimator(DROPOFF_MODEL_PATH)
-        logger.info(f"Loaded Dropoff model from {DROPOFF_MODEL_PATH}")
+        app.state.dropoff_model = DropoffETAEstimator(DROPOFF_MODEL_PATH)
+        logger.info(f"Loaded dropoff ETA model from {DROPOFF_MODEL_PATH}")
     except FileNotFoundError:
-        logger.warning(f"Dropoff model not found at {DROPOFF_MODEL_PATH}, trip quote endpoint will be disabled")
-        dropoff_model = None
+        logger.warning(f"Dropoff ETA model not found at {DROPOFF_MODEL_PATH}")
+        app.state.dropoff_model = None
     except Exception as e:
-        logger.error(f"Failed to load Dropoff model: {e}")
-        dropoff_model = None
+        logger.error(f"Failed to load dropoff ETA model: {e}")
+        app.state.dropoff_model = None
 
     try:
         osrm_client = get_osrm_client()
-        osrm_available = osrm_client.health_check()
-        if osrm_available:
+        app.state.osrm_available = osrm_client.health_check()
+        if app.state.osrm_available:
             logger.info("OSRM routing service is available")
         else:
-            logger.warning("OSRM routing service is not available, falling back to haversine distance")
+            logger.warning("OSRM routing service is not available, falling back to haversine")
     except Exception as e:
         logger.warning(f"Could not connect to OSRM: {e}")
-        osrm_available = False
+        app.state.osrm_available = False
 
     yield
-    
-    if redis_client:
-        redis_client.close()
+
+    if app.state.redis_client:
+        app.state.redis_client.close()
         logger.info("Redis connection closed")
 
 
+# ── Application ───────────────────────────────────────────────────────────────
+
+API_DESCRIPTION = """\
+Real-time inference API for a ride-hailing simulation in **Madrid**. \
+Serves dynamic surge pricing, ML-predicted ETAs, and OSRM routing \
+using marketplace features aggregated from Kafka into Redis time windows.
+"""
+
 app = FastAPI(
-    title="Ride-Hailing Dynamic Pricing ETA System",
-    description="Real-time feature retrieval for dynamic pricing inference",
+    title="Ride-Hailing Inference API",
+    summary="ML-powered pricing, ETA, and routing for real-time ride-hailing",
+    description=API_DESCRIPTION,
     version="1.0.0",
+    openapi_tags=TAGS_METADATA,
     lifespan=lifespan,
+    license_info={
+        "name": "MIT",
+    },
 )
 
 app.mount("/metrics", metrics_app)
 
-
-@app.get("/health")
-def health():
-    """Health check endpoint."""
-    try:
-        if redis_client is None:
-            raise HTTPException(status_code=503, detail="Redis not initialized")
-        redis_client.ping()
-        
-        osrm_status = "connected" if osrm_available else "unavailable"
-        
-        return {
-            "status": "ok",
-            "redis": "connected",
-            "osrm": osrm_status,
-        }
-    except Exception as e:
-        raise HTTPException(status_code=503, detail=f"Redis unhealthy: {e}")
-
-
-@app.get("/v1/features")
-def get_features(
-    lat: float,
-    lng: float,
-    timestamp: str | None = None,
-):
-    """
-    Get derived features for a location.
-    
-    Args:
-        lat: Latitude
-        lng: Longitude  
-        timestamp: Optional ISO timestamp (defaults to now)
-    
-    Returns:
-        Feature vector with 1m, 5m, 15m window aggregations
-    """
-    if timestamp:
-        try:
-            ts = datetime.fromisoformat(timestamp)
-        except ValueError:
-            raise HTTPException(status_code=400, detail="Invalid timestamp format")
-    else:
-        ts = datetime.now(timezone.utc)
-    
-    if ts.tzinfo is None:
-        ts = ts.replace(tzinfo=timezone.utc)
-
-    try:
-        h3_index = h3.latlng_to_cell(lat, lng, 8)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Invalid coordinates: {e}")
-
-    feature_vector = {}
-    for window in WINDOWS:
-        raw = fetch_window(
-            redis_client=redis_client,
-            city=CITY,
-            h3_index=h3_index,
-            window=window,
-            ts=ts,
-        )
-        derived = derive_features(raw)
-        feature_vector[f"{window}m"] = derived
-
-    return {
-        "h3_res8": h3_index,
-        "timestamp": ts.isoformat(),
-        "features": feature_vector,
-    }
-
-
-@app.get("/v1/features/debug")
-def get_features_debug(
-    lat: float,
-    lng: float,
-    timestamp: str | None = None,
-):
-    """
-    Debug endpoint to inspect assembled feature vector with raw data.
-    
-    Same as /v1/features but includes raw Redis snapshots.
-    """
-    if timestamp:
-        try:
-            ts = datetime.fromisoformat(timestamp)
-        except ValueError:
-            raise HTTPException(status_code=400, detail="Invalid timestamp format")
-    else:
-        ts = datetime.now(timezone.utc)
-    
-    if ts.tzinfo is None:
-        ts = ts.replace(tzinfo=timezone.utc)
-
-    try:
-        h3_index = h3.latlng_to_cell(lat, lng, 8)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Invalid coordinates: {e}")
-
-    feature_vector = {}
-    raw_snapshots = {}
-    
-    for window in WINDOWS:
-        raw = fetch_window(
-            redis_client=redis_client,
-            city=CITY,
-            h3_index=h3_index,
-            window=window,
-            ts=ts,
-        )
-        derived = derive_features(raw)
-        feature_vector[f"{window}m"] = derived
-        raw_snapshots[f"{window}m"] = raw
-
-    return {
-        "h3_res8": h3_index,
-        "timestamp": ts.isoformat(),
-        "features": feature_vector,
-        "raw": raw_snapshots,
-    }
-
-
-@app.post("/v1/pricing/quote")
-def pricing_quote(
-    lat: float,
-    lng: float,
-    timestamp: str | None = None,
-):
-    """
-    Get a dynamic pricing quote for a location.
-
-    Uses 5-minute window features to compute surge pricing multiplier.
-    Includes monitoring for latency and feature drift.
-
-    Args:
-        lat: Latitude
-        lng: Longitude
-        timestamp: Optional ISO timestamp (defaults to now)
-
-    Returns:
-        Pricing quote with multiplier and feature breakdown
-    """
-    start = time.perf_counter()
-
-    if timestamp:
-        try:
-            ts = datetime.fromisoformat(timestamp)
-        except ValueError:
-            REQUEST_COUNTER.labels(endpoint="pricing_quote", status="400").inc()
-            raise HTTPException(status_code=400, detail="Invalid timestamp format")
-    else:
-        ts = datetime.now(timezone.utc)
-
-    if ts.tzinfo is None:
-        ts = ts.replace(tzinfo=timezone.utc)
-
-    try:
-        h3_index = h3.latlng_to_cell(lat, lng, 8)
-    except Exception as e:
-        REQUEST_COUNTER.labels(endpoint="pricing_quote", status="400").inc()
-        raise HTTPException(status_code=400, detail=f"Invalid coordinates: {e}")
-
-    feature_start = time.perf_counter()
-    raw_5m = fetch_window(
-        redis_client=redis_client,
-        city=CITY,
-        h3_index=h3_index,
-        window=5,
-        ts=ts,
-    )
-    FEATURE_FETCH_LATENCY.labels(endpoint="pricing_quote").observe(time.perf_counter() - feature_start)
-
-    features_5m = derive_features(raw_5m)
-    pricing = compute_price_multiplier(features_5m)
-
-    record_feature_snapshot(
-        redis_client=redis_client,
-        city=CITY,
-        features=features_5m,
-    )
-
-    latency_ms = (time.perf_counter() - start) * 1000
-    record_latency(redis_client, "pricing", latency_ms)
-    REQUEST_LATENCY.labels(endpoint="pricing_quote").observe(latency_ms / 1000)
-    REQUEST_COUNTER.labels(endpoint="pricing_quote", status="200").inc()
-
-    return {
-        "city": CITY,
-        "h3_res8": h3_index,
-        "timestamp": ts.isoformat(),
-        "features": features_5m,
-        "pricing": pricing,
-        "latency_ms": round(latency_ms, 2),
-    }
-
-
-@app.get("/v1/monitoring/drift")
-def drift_summary():
-    """
-    Get feature drift summary statistics.
-    
-    Analyzes stored feature snapshots to compute percentile statistics
-    for key features, useful for detecting distribution drift over time.
-    
-    Returns:
-        Summary with p50 and p95 for key features, or insufficient_data status
-    """
-    key = f"drift:{CITY}"
-    data = redis_client.lrange(key, 0, -1)
-
-    if len(data) < 50:
-        return {"status": "insufficient_data", "samples": len(data)}
-
-    parsed = [json.loads(x)["features"] for x in data]
-
-    def summarize(field):
-        values = [f[field] for f in parsed if field in f]
-        if not values:
-            return {"p50": 0.0, "p95": 0.0}
-        return {
-            "p50": round(float(np.percentile(values, 50)), 3),
-            "p95": round(float(np.percentile(values, 95)), 3),
-        }
-
-    return {
-        "city": CITY,
-        "samples": len(parsed),
-        "features": {
-            "supply_demand_ratio": summarize("supply_demand_ratio"),
-            "deadhead_km_avg": summarize("deadhead_km_avg"),
-            "surge_pressure": summarize("surge_pressure"),
-        },
-    }
-
-
-@app.post("/v1/eta/quote")
-def eta_quote(
-    lat: float,
-    lng: float,
-    trip_distance_km: float,
-    timestamp: str | None = None,
-):
-    """
-    Get an ETA estimate for a trip.
-    
-    Uses marketplace features and trip distance to predict
-    estimated time of arrival using an XGBoost model.
-    
-    Args:
-        lat: Pickup latitude
-        lng: Pickup longitude
-        trip_distance_km: Estimated trip distance in kilometers
-        timestamp: Optional ISO timestamp (defaults to now)
-    
-    Returns:
-        ETA prediction in seconds and minutes with latency
-    """
-    if pickup_model is None:
-        REQUEST_COUNTER.labels(endpoint="eta_quote", status="503").inc()
-        raise HTTPException(
-            status_code=503,
-            detail="ETA model not loaded. Please ensure model file exists."
-        )
-
-    start = time.perf_counter()
-
-    if timestamp:
-        try:
-            ts = datetime.fromisoformat(timestamp)
-        except ValueError:
-            REQUEST_COUNTER.labels(endpoint="eta_quote", status="400").inc()
-            raise HTTPException(status_code=400, detail="Invalid timestamp format")
-    else:
-        ts = datetime.now(timezone.utc)
-
-    if ts.tzinfo is None:
-        ts = ts.replace(tzinfo=timezone.utc)
-
-    try:
-        h3_index = h3.latlng_to_cell(lat, lng, 8)
-    except Exception as e:
-        REQUEST_COUNTER.labels(endpoint="eta_quote", status="400").inc()
-        raise HTTPException(status_code=400, detail=f"Invalid coordinates: {e}")
-
-    feature_start = time.perf_counter()
-    raw_5m = fetch_window(
-        redis_client=redis_client,
-        city=CITY,
-        h3_index=h3_index,
-        window=5,
-        ts=ts,
-    )
-    FEATURE_FETCH_LATENCY.labels(endpoint="eta_quote").observe(time.perf_counter() - feature_start)
-
-    features_5m = derive_features(raw_5m)
-
-    eta_features = assemble_pickup_features(
-        trip_distance_km=trip_distance_km,
-        features_5m=features_5m,
-    )
-
-    model_start = time.perf_counter()
-    eta_seconds = pickup_model.predict(eta_features)
-    MODEL_INFERENCE_LATENCY.labels(model="pickup_eta").observe(time.perf_counter() - model_start)
-
-    latency_ms = (time.perf_counter() - start) * 1000
-    record_latency(redis_client, "eta", latency_ms)
-    REQUEST_LATENCY.labels(endpoint="eta_quote").observe(latency_ms / 1000)
-    REQUEST_COUNTER.labels(endpoint="eta_quote", status="200").inc()
-
-    return {
-        "city": CITY,
-        "h3_res8": h3_index,
-        "trip_distance_km": trip_distance_km,
-        "eta_seconds": int(eta_seconds),
-        "eta_minutes": round(eta_seconds / 60, 1),
-        "latency_ms": round(latency_ms, 2),
-    }
-
-
-@app.get("/v1/route")
-def get_route(
-    origin_lat: float,
-    origin_lng: float,
-    dest_lat: float,
-    dest_lng: float,
-):
-    """
-    Get route information between two points using OSRM.
-    
-    Returns road network distance and free-flow duration.
-    Falls back to haversine distance if OSRM is unavailable.
-    
-    Args:
-        origin_lat, origin_lng: Origin coordinates
-        dest_lat, dest_lng: Destination coordinates
-    
-    Returns:
-        Route distance (km) and duration (minutes)
-    """
-    osrm_client = get_osrm_client()
-    
-    try:
-        route = osrm_client.get_route(
-            origin=(origin_lng, origin_lat),
-            destination=(dest_lng, dest_lat),
-        )
-        return {
-            "source": "osrm",
-            "distance_km": round(route.distance_km, 2),
-            "duration_min": round(route.duration_min, 1),
-            "duration_s": round(route.duration_s, 0),
-        }
-    except OSRMError as e:
-        # Fallback to haversine
-        distance_km = haversine_km(origin_lat, origin_lng, dest_lat, dest_lng)
-        duration_min = (distance_km / HAVERSINE_FALLBACK_SPEED_KMH) * 60
-        
-        return {
-            "source": "haversine_fallback",
-            "distance_km": round(distance_km, 2),
-            "duration_min": round(duration_min, 1),
-            "duration_s": round(duration_min * 60, 0),
-            "warning": f"OSRM unavailable: {e}",
-        }
-
-
-@app.post("/v1/quote")
-def trip_quote(
-    origin_lat: float,
-    origin_lng: float,
-    dest_lat: float,
-    dest_lng: float,
-    timestamp: str | None = None,
-):
-    """
-    Get a complete trip quote with ETA and pricing using OSRM routing.
-    
-    Combines:
-    - OSRM routing for accurate road network distance and duration
-    - Pickup ETA prediction (ML model)
-    - Dropoff ETA with congestion adjustment
-    - Dynamic pricing based on market conditions
-    
-    Args:
-        origin_lat, origin_lng: Pickup location coordinates
-        dest_lat, dest_lng: Destination coordinates
-        timestamp: Optional ISO timestamp (defaults to now)
-    
-    Returns:
-        Complete trip quote with route info, ETAs and pricing
-    """
-    if pickup_model is None:
-        REQUEST_COUNTER.labels(endpoint="trip_quote", status="503").inc()
-        raise HTTPException(
-            status_code=503,
-            detail="Pickup ETA model not loaded. Please ensure model file exists."
-        )
-
-    if dropoff_model is None:
-        REQUEST_COUNTER.labels(endpoint="trip_quote", status="503").inc()
-        raise HTTPException(
-            status_code=503,
-            detail="Dropoff ETA model not loaded. Please ensure model file exists."
-        )
-
-    start = time.perf_counter()
-
-    if timestamp:
-        try:
-            ts = datetime.fromisoformat(timestamp)
-        except ValueError:
-            REQUEST_COUNTER.labels(endpoint="trip_quote", status="400").inc()
-            raise HTTPException(status_code=400, detail="Invalid timestamp format")
-    else:
-        ts = datetime.now(timezone.utc)
-
-    if ts.tzinfo is None:
-        ts = ts.replace(tzinfo=timezone.utc)
-
-    # --- GEO ---
-    try:
-        h3_origin = h3.latlng_to_cell(origin_lat, origin_lng, 8)
-    except Exception as e:
-        REQUEST_COUNTER.labels(endpoint="trip_quote", status="400").inc()
-        raise HTTPException(status_code=400, detail=f"Invalid origin coordinates: {e}")
-
-    # --- ROUTING (OSRM with fallback) ---
-    osrm_client = get_osrm_client()
-    routing_source = "osrm"
-
-    try:
-        route = osrm_client.get_route(
-            origin=(origin_lng, origin_lat),
-            destination=(dest_lng, dest_lat),
-        )
-        trip_distance_km = route.distance_km
-        osrm_duration_s = route.duration_s
-    except OSRMError as e:
-        # Fallback to haversine distance
-        logger.warning(f"OSRM unavailable, using haversine fallback: {e}")
-        routing_source = "haversine_fallback"
-        OSRM_FALLBACK_COUNTER.inc()
-        trip_distance_km = haversine_km(origin_lat, origin_lng, dest_lat, dest_lng)
-        # Estimate free-flow duration assuming 35 km/h average
-        osrm_duration_s = (trip_distance_km / 35) * 3600
-
-    if trip_distance_km < 0.1:
-        REQUEST_COUNTER.labels(endpoint="trip_quote", status="400").inc()
-        raise HTTPException(status_code=400, detail="Origin and destination too close")
-
-    # --- FEATURES ---
-    feature_start = time.perf_counter()
-    raw_5m = fetch_window(
-        redis_client=redis_client,
-        city=CITY,
-        h3_index=h3_origin,
-        window=5,
-        ts=ts,
-    )
-    FEATURE_FETCH_LATENCY.labels(endpoint="trip_quote").observe(time.perf_counter() - feature_start)
-    features_5m = derive_features(raw_5m)
-
-    # --- PICKUP ETA (ML) ---
-    pickup_features = assemble_pickup_features(
-        trip_distance_km=trip_distance_km,
-        features_5m=features_5m,
-    )
-    model_start = time.perf_counter()
-    pickup_eta = pickup_model.predict(pickup_features)
-    MODEL_INFERENCE_LATENCY.labels(model="pickup_eta").observe(time.perf_counter() - model_start)
-
-    # --- DROPOFF ETA (OSRM + Congestion Adjustment) ---
-    surge_pressure = features_5m["surge_pressure"]
-    dropoff_eta = adjust_dropoff_eta(
-        osrm_duration_s=osrm_duration_s,
-        surge_pressure=surge_pressure,
-    )
-    congestion_factor = compute_congestion_factor(surge_pressure)
-
-    # --- TOTAL ETA ---
-    total_eta = pickup_eta + dropoff_eta
-
-    # --- PRICING ---
-    pricing = compute_price_multiplier(features_5m)
-    base_fare = 1.5  # EUR
-    price_per_km = 1.2  # EUR/km
-    price = (base_fare + trip_distance_km * price_per_km) * pricing["multiplier"]
-
-    # --- MONITORING ---
-    latency_ms = (time.perf_counter() - start) * 1000
-    record_latency(redis_client, "trip_quote", latency_ms)
-    REQUEST_LATENCY.labels(endpoint="trip_quote").observe(latency_ms / 1000)
-    REQUEST_COUNTER.labels(endpoint="trip_quote", status="200").inc()
-
-    return {
-        "city": CITY,
-        "h3_origin": h3_origin,
-        "route": {
-            "source": routing_source,
-            "distance_km": round(trip_distance_km, 2),
-            "osrm_duration_min": round(osrm_duration_s / 60, 1),
-        },
-        "eta": {
-            "pickup_seconds": int(pickup_eta),
-            "dropoff_seconds": int(dropoff_eta),
-            "dropoff_free_flow_seconds": int(osrm_duration_s),
-            "congestion_factor": round(congestion_factor, 2),
-            "total_seconds": int(total_eta),
-            "total_minutes": round(total_eta / 60, 1),
-        },
-        "price": {
-            "amount_eur": round(price, 2),
-            "multiplier": pricing["multiplier"],
-            "surge_level": pricing["surge_level"],
-            "reasons": pricing["reasons"],
-        },
-        "latency_ms": round(latency_ms, 2),
-    }
+app.include_router(health_router)
+app.include_router(features_router)
+app.include_router(pricing_router)
+app.include_router(eta_router)
+app.include_router(routing_router)
+app.include_router(quotes_router)
+app.include_router(monitoring_router)
