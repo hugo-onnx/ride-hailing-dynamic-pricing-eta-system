@@ -83,7 +83,7 @@ class ConnectionManager:
             return
 
         disconnected = []
-        for connection in self.active_connections:
+        for connection in list(self.active_connections):
             window = self.client_windows.get(connection, 5)
             payload = cached_data.get(window)
             if payload is None:
@@ -370,7 +370,11 @@ async def websocket_endpoint(websocket: WebSocket):
                 )
                 
                 # Handle ping/pong
-                message = json.loads(data)
+                try:
+                    message = json.loads(data)
+                except json.JSONDecodeError:
+                    logger.warning(f"Received invalid JSON from client: {data!r}")
+                    continue
                 if message.get('type') == 'ping':
                     await websocket.send_json({'type': 'pong'})
                 elif message.get('type') == 'request_update':
